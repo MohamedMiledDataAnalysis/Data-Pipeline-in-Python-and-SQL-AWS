@@ -32,7 +32,7 @@ from datetime import date, datetime, timedelta
 import numpy as np
 import pandas as pd
 import requests
-from sqlalchemy import Column, Date, Float, MetaData, String, Table, create_engine, delete
+from sqlalchemy import bindparam, create_engine, text
 from sqlalchemy.engine import URL
 
 # ---------------------------------------------------------------------------
@@ -43,7 +43,44 @@ BASE_CURRENCY = "EUR"
 CURRENCIES = ["USD", "GBP", "CHF", "JPY", "CAD"]
 END_DATE = date.today()
 START_DATE = END_DATE - timedelta(days=60)   # the API returns every business day for up to 90 days
-TABLE_NAME = "fx_rate"
+TABLE_NAME = "dbo.fx_rate"
+
+
+# ---------------------------------------------------------------------------
+# SQL statements (T-SQL for SQL Server)
+# ---------------------------------------------------------------------------
+# Create the table only if it does not exist yet. OBJECT_ID returns NULL when
+# no user table ('U') has that name, so existing data is never touched.
+# The primary key stops duplicates at database level, as a second line of
+# defence behind the quality checks.
+CREATE_TABLE_SQL = f"""
+IF OBJECT_ID(N'{TABLE_NAME}', N'U') IS NULL
+BEGIN
+    CREATE TABLE {TABLE_NAME} (
+        rate_date       DATE        NOT NULL,
+        base_currency   VARCHAR(3)  NOT NULL,
+        quote_currency  VARCHAR(3)  NOT NULL,
+        rate            FLOAT       NOT NULL,
+        CONSTRAINT PK_fx_rate PRIMARY KEY (rate_date, base_currency, quote_currency)
+    );
+END
+"""
+
+# Remove the rows of the period being reloaded, for the requested currencies only.
+# :start_date, :end_date, :base and :currencies are parameters: values are sent
+# separately from the SQL text, which prevents SQL injection.
+DELETE_SQL = text(f"""
+DELETE FROM {TABLE_NAME}
+WHERE rate_date BETWEEN :start_date AND :end_date
+  AND base_currency = :base
+  AND quote_currency IN :currencies
+""").bindparams(bindparam("currencies", expanding=True))   # expands the list to IN (?, ?, ?, ...)
+
+# Insert one row. Executed with a list of rows, it becomes a bulk insert.
+INSERT_SQL = text(f"""
+INSERT INTO {TABLE_NAME} (rate_date, base_currency, quote_currency, rate)
+VALUES (:rate_date, :base_currency, :quote_currency, :rate)
+""")
 
 
 # ---------------------------------------------------------------------------
@@ -268,26 +305,23 @@ def load(df: pd.DataFrame, engine) -> None:
     """Create the table if needed, replace the period's rows, insert the new ones."""
     print(f"[4/4] Loading into SQL Server table {TABLE_NAME}")
 
-    # Table definition. The primary key stops duplicates at database level too.
-    metadata = MetaData()
-    table = Table(
-        TABLE_NAME, metadata,
-        Column("rate_date", Date, primary_key=True),
-        Column("base_currency", String(3), primary_key=True),
-        Column("quote_currency", String(3), primary_key=True),
-        Column("rate", Float, nullable=False),
-    )
-    metadata.create_all(engine)   # CREATE TABLE only if it does not exist yet
-
-    # One transaction: delete the period, insert the new rows. If the insert fails,
-    # the delete is rolled back, so the old data is never lost.
-    # Running the script twice therefore never creates duplicates.
+    # engine.begin() opens ONE transaction, committed at the end of the block.
+    # If any statement fails, everything is rolled back: the old data is never lost.
     with engine.begin() as conn:
-        conn.execute(delete(table).where(
-            table.c.rate_date.between(df["rate_date"].min(), df["rate_date"].max()),
-            table.c.quote_currency.in_(CURRENCIES),
-        ))
-        conn.execute(table.insert(), df.to_dict(orient="records"))
+        # 1. Create the table on the first run (see CREATE_TABLE_SQL at the top).
+        conn.execute(text(CREATE_TABLE_SQL))
+
+        # 2. Delete the period being reloaded, so running the script twice
+        #    never creates duplicates.
+        conn.execute(DELETE_SQL, {
+            "start_date": df["rate_date"].min(),
+            "end_date": df["rate_date"].max(),
+            "base": BASE_CURRENCY,
+            "currencies": CURRENCIES,
+        })
+
+        # 3. Insert the new rows: a list of dictionaries, one per row.
+        conn.execute(INSERT_SQL, df.to_dict(orient="records"))
 
     print(f"      {len(df)} rows loaded")
 

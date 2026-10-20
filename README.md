@@ -141,7 +141,7 @@ Example output:
       PASS       Date within requested period
       PASS       Date is a weekday
       PASS       All currencies present
-[4/4] Loading into SQL Server table fx_rate
+[4/4] Loading into SQL Server table dbo.fx_rate
       215 rows loaded
 Done.
 ```
@@ -153,28 +153,47 @@ BASE_CURRENCY = "EUR"
 CURRENCIES = ["USD", "GBP", "CHF", "JPY", "CAD"]
 END_DATE = date.today()
 START_DATE = END_DATE - timedelta(days=60)   # keep the period within 90 days
-TABLE_NAME = "fx_rate"
+TABLE_NAME = "dbo.fx_rate"
 ```
 
 Keep the period within 90 days: for longer periods the API returns weekly instead of daily rates.
 
 ## The SQL table
 
-The script creates the table on its first run:
+All the SQL is written in T-SQL at the top of the script, in three constants: `CREATE_TABLE_SQL`, `DELETE_SQL` and `INSERT_SQL`. The `load()` function runs them in that order.
+
+**1. Create the table on the first run** (`CREATE_TABLE_SQL`):
 
 ```sql
-CREATE TABLE fx_rate (
-    rate_date       DATE        NOT NULL,
-    base_currency   VARCHAR(3)  NOT NULL,
-    quote_currency  VARCHAR(3)  NOT NULL,
-    rate            FLOAT       NOT NULL,
-    PRIMARY KEY (rate_date, base_currency, quote_currency)
-);
+IF OBJECT_ID(N'dbo.fx_rate', N'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.fx_rate (
+        rate_date       DATE        NOT NULL,
+        base_currency   VARCHAR(3)  NOT NULL,
+        quote_currency  VARCHAR(3)  NOT NULL,
+        rate            FLOAT       NOT NULL,
+        CONSTRAINT PK_fx_rate PRIMARY KEY (rate_date, base_currency, quote_currency)
+    );
+END
 ```
 
-The primary key stops duplicates at database level, as a second line of defence behind the quality checks.
+`OBJECT_ID` returns `NULL` when no table has that name, so the table is created once and existing data is never touched. The primary key stops duplicates at database level, as a second line of defence behind the quality checks.
 
-**Re-running is safe.** Inside one transaction, the script deletes the rows for the loaded period and currencies, then inserts the new rows. Running it twice gives the same table, never twice the rows. If the insert fails, the delete is rolled back and the existing data is kept.
+**2. Delete the period being reloaded** (`DELETE_SQL`), then **3. insert the new rows** (`INSERT_SQL`):
+
+```sql
+DELETE FROM dbo.fx_rate
+WHERE rate_date BETWEEN :start_date AND :end_date
+  AND base_currency = :base
+  AND quote_currency IN :currencies;
+
+INSERT INTO dbo.fx_rate (rate_date, base_currency, quote_currency, rate)
+VALUES (:rate_date, :base_currency, :quote_currency, :rate);
+```
+
+The `:name` markers are parameters: the values are sent to SQL Server separately from the SQL text, which prevents SQL injection. The insert runs once with the full list of rows, as a bulk insert (`fast_executemany`).
+
+**Re-running is safe.** The three statements run in one transaction. Running the script twice gives the same table, never twice the rows. If any statement fails, the whole transaction is rolled back and the existing data is kept.
 
 Example queries:
 
@@ -184,7 +203,7 @@ SELECT quote_currency, rate_date, rate
 FROM (
     SELECT quote_currency, rate_date, rate,
            ROW_NUMBER() OVER (PARTITION BY quote_currency ORDER BY rate_date DESC) AS rn
-    FROM fx_rate
+    FROM dbo.fx_rate
 ) AS latest
 WHERE rn = 1;
 
@@ -192,7 +211,7 @@ WHERE rn = 1;
 SELECT quote_currency, rate_date, rate,
        100.0 * (rate - LAG(rate) OVER (PARTITION BY quote_currency ORDER BY rate_date))
              / LAG(rate) OVER (PARTITION BY quote_currency ORDER BY rate_date) AS pct_change
-FROM fx_rate
+FROM dbo.fx_rate
 ORDER BY quote_currency, rate_date;
 ```
 
