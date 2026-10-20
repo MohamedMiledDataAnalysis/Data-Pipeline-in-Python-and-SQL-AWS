@@ -1,10 +1,11 @@
-# FX Rates to SQL Server: a simple ETL script with data quality checks
+# FX Rates ETL: API to SQL Server and AWS S3, with data quality checks
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![SQL Server](https://img.shields.io/badge/database-SQL%20Server-red)
+![AWS S3](https://img.shields.io/badge/storage-AWS%20S3-orange)
 ![Licence](https://img.shields.io/badge/licence-MIT-green)
 
-A single Python script that extracts daily exchange rates from a public API, transforms the JSON into a pandas DataFrame, checks data quality, and loads the data into Microsoft SQL Server using credentials kept outside the code.
+A single Python script that extracts daily exchange rates from a public API, transforms the JSON into a pandas DataFrame, checks data quality, then loads the same data into Microsoft SQL Server and exports it to AWS S3 as CSV, Excel and JSON files. Credentials are kept outside the code.
 
 ## What it does
 
@@ -24,12 +25,20 @@ A single Python script that extracts daily exchange rates from a public API, tra
         ▼
  Typed DataFrame
         │
-        │  4. LOAD        one transaction: delete the period, insert the rows
-        ▼
- SQL Server table dbo.fx_rate
+        ├──────────────────────────────────────────┐
+        │  4. LOAD                                 │  5. EXPORT
+        │  one transaction: delete the period,     │  one file per format,
+        │  insert the rows                         │  built in memory
+        ▼                                          ▼
+ SQL Server table dbo.fx_rate               AWS S3 bucket
+                                            ├── format=csv/   …/fx_rates_….csv
+                                            ├── format=excel/ …/fx_rates_….xlsx
+                                            └── format=json/  …/fx_rates_….json
 ```
 
 By default the script loads the last 60 days of euro exchange rates against USD, GBP, CHF, JPY and CAD.
+
+Steps 4 and 5 are each optional. A step runs when its settings are present: `SQL_SERVER` for SQL Server, `S3_BUCKET` for S3. Set one or both.
 
 ## Data quality checks
 
@@ -62,13 +71,14 @@ When a type check fails, the report shows up to three offending values with thei
 | All requested currencies present | a missing currency means the extraction is broken |
 | Daily move above 5% | **warning only**: such a move is rare but can be genuine |
 
-If any check fails (warnings excepted), the script stops with exit code 1 and nothing is written to the database.
+If any check fails (warnings excepted), the script stops with exit code 1 and nothing is written to SQL Server or S3.
 
 ## Requirements
 
 - Python 3.10 or later
 - Microsoft [ODBC Driver 18 for SQL Server](https://learn.microsoft.com/sql/connect/odbc/download-odbc-driver-for-sql-server)
-- A SQL Server database (local, on a server, or Azure SQL Database) and a login allowed to create a table and insert rows
+- For SQL Server: a database (local, on a server, or Azure SQL Database) and a login allowed to create a table and insert rows
+- For AWS S3: an existing bucket and AWS credentials allowed to write to it (see [AWS permissions](#aws-permissions))
 
 ## Installation
 
@@ -95,15 +105,35 @@ Credentials are never written in the code. The script reads them from environmen
    SQL_USER=my_login
    SQL_PASSWORD=my_password
    SQL_DRIVER=ODBC Driver 18 for SQL Server
+
+   S3_BUCKET=my-data-lake
+   S3_PREFIX=fx-rates
+   AWS_REGION=eu-west-2
+   AWS_ACCESS_KEY_ID=AKIA...
+   AWS_SECRET_ACCESS_KEY=...
    ```
+
+**SQL Server**
 
 | Variable | Required | Notes |
 |---|---|---|
-| `SQL_SERVER` | yes | e.g. `localhost`, `myserver.database.windows.net` |
-| `SQL_DATABASE` | yes | the database must already exist |
+| `SQL_SERVER` | to load into SQL Server | e.g. `localhost`, `myserver.database.windows.net` |
+| `SQL_DATABASE` | with `SQL_SERVER` | the database must already exist |
 | `SQL_USER` | no | leave empty to use **Windows authentication** |
 | `SQL_PASSWORD` | with `SQL_USER` | special characters (`@`, `#`, `/`) are escaped automatically |
 | `SQL_DRIVER` | no | default: `ODBC Driver 18 for SQL Server` |
+
+**AWS S3**
+
+| Variable | Required | Notes |
+|---|---|---|
+| `S3_BUCKET` | to export to S3 | the bucket must already exist |
+| `S3_PREFIX` | no | folder inside the bucket, default: `fx-rates` |
+| `AWS_REGION` | no | e.g. `eu-west-2` (London), `eu-west-3` (Paris) |
+| `AWS_ACCESS_KEY_ID` | no | leave both keys empty to use an AWS profile or an IAM role |
+| `AWS_SECRET_ACCESS_KEY` | with the key ID | |
+
+The script never reads the AWS keys itself: boto3, the AWS library, looks for credentials in this order: the environment variables above, the profile in `~/.aws/credentials` (set up with `aws configure`), then the IAM role of the machine (EC2, ECS, Lambda). On AWS infrastructure, an IAM role is the safer choice: no key is stored anywhere.
 
 `.env` is listed in `.gitignore`, so your password is never committed to GitHub. A variable set in the real environment takes precedence over the same variable in `.env`.
 
@@ -113,14 +143,14 @@ Credentials are never written in the code. The script reads them from environmen
 python fx_to_sqlserver.py
 ```
 
-Example output:
+Example output, with both destinations set:
 
 ```
-[1/4] Extracting https://api.frankfurter.dev/v1/2026-08-21..2026-10-20
+[1/5] Extracting https://api.frankfurter.dev/v1/2026-08-21..2026-10-20
       43 dates received
-[2/4] Transforming JSON into a DataFrame
+[2/5] Transforming JSON into a DataFrame
       215 rows, 5 currencies
-[3/4] Checking data quality
+[3/5] Checking data quality
       -- Structure and data types
       PASS       Dataset is not empty
       PASS       All expected columns present
@@ -141,8 +171,12 @@ Example output:
       PASS       Date within requested period
       PASS       Date is a weekday
       PASS       All currencies present
-[4/4] Loading into SQL Server table dbo.fx_rate
+[4/5] Loading into SQL Server table dbo.fx_rate
       215 rows loaded
+[5/5] Exporting to AWS S3 bucket my-data-lake
+      s3://my-data-lake/fx-rates/format=csv/load_date=2026-10-20/fx_rates_EUR_2026-08-21_2026-10-20.csv  (5,389 bytes)
+      s3://my-data-lake/fx-rates/format=excel/load_date=2026-10-20/fx_rates_EUR_2026-08-21_2026-10-20.xlsx  (8,777 bytes)
+      s3://my-data-lake/fx-rates/format=json/load_date=2026-10-20/fx_rates_EUR_2026-08-21_2026-10-20.json  (23,837 bytes)
 Done.
 ```
 
@@ -215,21 +249,68 @@ FROM dbo.fx_rate
 ORDER BY quote_currency, rate_date;
 ```
 
+## The S3 export
+
+The `export_to_s3()` function uploads the checked data once per format. Each file is built in memory and sent directly to S3: nothing is written to the local disk.
+
+| Format | Content | Dates |
+|---|---|---|
+| CSV | header row, comma-separated, UTF-8 | text `2026-10-01` |
+| Excel (.xlsx) | one sheet named `fx_rates` | real Excel dates, so they sort and filter correctly |
+| JSON | array of records: `[{"rate_date": "2026-10-01", "base_currency": "EUR", "quote_currency": "USD", "rate": 1.0921}, ...]` | text `2026-10-01` |
+
+**Folder layout.** Files are organised by format and load date:
+
+```
+s3://<bucket>/<prefix>/format=<csv|excel|json>/load_date=<YYYY-MM-DD>/fx_rates_<BASE>_<first date>_<last date>.<ext>
+```
+
+The `name=value` folders follow the Hive partitioning convention, so AWS Athena or AWS Glue can query the CSV files as a table, filtered by load date. The JSON file is a single array, which suits applications and APIs; Athena reads JSON only with one record per line (JSON Lines), which `to_json(orient="records", lines=True)` produces if you need it.
+
+**Re-running is safe.** A second run on the same day writes to the same file names and overwrites them: no duplicate files.
+
+**Each file is uploaded with:**
+- its content type (`text/csv`, `application/json`, the Excel type), so S3 and browsers recognise it;
+- server-side encryption (`AES256`), so the file is encrypted at rest.
+
+### AWS permissions
+
+The credentials need permission to write files under the prefix, and nothing more. A minimal IAM policy:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::my-data-lake/fx-rates/*"
+    }
+  ]
+}
+```
+
+Replace `my-data-lake` and `fx-rates` with your bucket and prefix.
+
 ## Troubleshooting
 
 | Message | Cause and fix |
 |---|---|
-| `Set SQL_SERVER and SQL_DATABASE` | `.env` is missing or not in the folder you run the script from |
+| `No destination set` | neither `SQL_SERVER` nor `S3_BUCKET` is set: `.env` is missing or not in the folder you run the script from |
+| `Set SQL_SERVER and SQL_DATABASE` | `SQL_SERVER` is set but `SQL_DATABASE` is not |
 | `Can't open lib 'ODBC Driver 18 for SQL Server'` | install the ODBC driver, or set `SQL_DRIVER` to the version installed (e.g. `ODBC Driver 17 for SQL Server`) |
 | `Login failed for user` | wrong user or password, or SQL authentication is disabled on the server |
 | `Cannot open database "FxRates"` | create the database first: `CREATE DATABASE FxRates;` |
+| `No AWS credentials found` | set the two AWS keys in `.env`, or run `aws configure` to create a profile |
+| `S3 upload failed (NoSuchBucket)` | the bucket name is wrong, or the bucket does not exist yet |
+| `S3 upload failed (AccessDenied)` | the credentials lack `s3:PutObject` on the bucket and prefix (see [AWS permissions](#aws-permissions)) |
 | `Data quality checks failed: nothing loaded.` | read the FAIL lines above it: they name the check and show the offending values |
 
 ## Project structure
 
 ```
 fx-to-sqlserver/
-├── fx_to_sqlserver.py   the ETL script: extract, transform, check, load
+├── fx_to_sqlserver.py   the ETL script: extract, transform, check, load, export
 ├── requirements.txt     Python dependencies
 ├── .env.example         credentials template (copy to .env)
 ├── .gitignore           keeps .env and local files out of git

@@ -1,5 +1,7 @@
 requests>=2.31     # HTTP call to the API
 pandas>=2.1        # DataFrame and data quality checks
 numpy>=1.26        # numeric type checks
-SQLAlchemy>=2.0    # database connection and table definition
+SQLAlchemy>=2.0    # database connection
 pyodbc>=5.0        # SQL Server driver for SQLAlchemy
+boto3>=1.34        # AWS SDK: upload to S3
+openpyxl>=3.1      # write Excel (.xlsx) files

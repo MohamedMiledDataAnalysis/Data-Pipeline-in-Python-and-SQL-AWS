@@ -1,37 +1,52 @@
 """
 fx_to_sqlserver.py
 ------------------
-A simple ETL script in four steps:
+A simple ETL script in five steps:
 
     1. EXTRACT    daily exchange rates from a public API (JSON)
     2. TRANSFORM  the JSON into a pandas DataFrame
     3. CHECK      data quality: data types first, then business rules;
                   stop if the data is not fit to load
     4. LOAD       the data into a SQL Server table, using credentials
+    5. EXPORT     the same data to AWS S3 as CSV, Excel and JSON files
+
+Steps 4 and 5 are each optional: a step runs when its settings are present
+(SQL_SERVER for step 4, S3_BUCKET for step 5). At least one must be set.
 
 Source: Frankfurter API (European Central Bank reference rates), free, no API key.
 
 Credentials are NEVER written in the code. They are read from environment
 variables (or from a .env file next to the script):
 
-    SQL_SERVER    e.g. localhost, myserver.database.windows.net
-    SQL_DATABASE  e.g. FxRates
-    SQL_USER      leave empty to use Windows authentication
+    SQL Server (step 4)
+    SQL_SERVER             e.g. localhost, myserver.database.windows.net
+    SQL_DATABASE           e.g. FxRates
+    SQL_USER               leave empty to use Windows authentication
     SQL_PASSWORD
-    SQL_DRIVER    default: ODBC Driver 18 for SQL Server
+    SQL_DRIVER             default: ODBC Driver 18 for SQL Server
 
-Install:  pip install requests pandas sqlalchemy pyodbc
+    AWS S3 (step 5)
+    S3_BUCKET              e.g. my-company-data-lake
+    S3_PREFIX              folder inside the bucket, default: fx-rates
+    AWS_REGION             e.g. eu-west-2
+    AWS_ACCESS_KEY_ID      or an AWS profile / IAM role: boto3 finds the
+    AWS_SECRET_ACCESS_KEY  credentials through the standard AWS chain
+
+Install:  pip install requests pandas sqlalchemy pyodbc boto3 openpyxl
 Run:      python fx_to_sqlserver.py
 """
 
+import io
 import numbers
 import os
 import sys
 from datetime import date, datetime, timedelta
 
+import boto3
 import numpy as np
 import pandas as pd
 import requests
+from botocore.exceptions import ClientError, NoCredentialsError
 from sqlalchemy import bindparam, create_engine, text
 from sqlalchemy.engine import URL
 
@@ -90,7 +105,7 @@ def extract() -> dict:
     """Call the API and return the JSON response as a Python dictionary."""
     url = f"{API_URL}/{START_DATE}..{END_DATE}"
     params = {"base": BASE_CURRENCY, "symbols": ",".join(CURRENCIES)}
-    print(f"[1/4] Extracting {url}")
+    print(f"[1/5] Extracting {url}")
 
     response = requests.get(url, params=params, timeout=30)
     response.raise_for_status()          # stop with an error on 4xx/5xx instead of parsing an error page
@@ -106,7 +121,7 @@ def extract() -> dict:
 # ---------------------------------------------------------------------------
 def transform(data: dict) -> pd.DataFrame:
     """Flatten the nested JSON into one row per (date, currency)."""
-    print("[2/4] Transforming JSON into a DataFrame")
+    print("[2/5] Transforming JSON into a DataFrame")
 
     rows = []
     for rate_date, quotes in data.get("rates", {}).items():   # one entry per date
@@ -196,7 +211,7 @@ def check_quality(df: pd.DataFrame) -> pd.DataFrame | None:
     Returns the DataFrame converted to the SQL types if every check passed,
     or None if the data must not be loaded.
     """
-    print("[3/4] Checking data quality")
+    print("[3/5] Checking data quality")
 
     # --- A. Structure and data types (on the raw values) -------------------------
     print("      -- Structure and data types")
@@ -269,7 +284,10 @@ def load_dotenv(path: str = ".env") -> None:
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
                 key, value = line.split("=", 1)
-                os.environ.setdefault(key.strip(), value.strip())
+                # Empty values (e.g. "AWS_ACCESS_KEY_ID=") are skipped, so the variable
+                # stays unset and boto3 falls back to the AWS profile or IAM role.
+                if value.strip():
+                    os.environ.setdefault(key.strip(), value.strip())
 
 
 def get_engine():
@@ -303,7 +321,7 @@ def get_engine():
 
 def load(df: pd.DataFrame, engine) -> None:
     """Create the table if needed, replace the period's rows, insert the new ones."""
-    print(f"[4/4] Loading into SQL Server table {TABLE_NAME}")
+    print(f"[4/5] Loading into SQL Server table {TABLE_NAME}")
 
     # engine.begin() opens ONE transaction, committed at the end of the block.
     # If any statement fails, everything is rolled back: the old data is never lost.
@@ -327,9 +345,97 @@ def load(df: pd.DataFrame, engine) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 5. EXPORT TO AWS S3
+# ---------------------------------------------------------------------------
+# Each writer turns the DataFrame into the bytes of one file, in memory:
+# nothing is written to the local disk.
+
+def to_csv_bytes(df: pd.DataFrame) -> bytes:
+    """CSV with a header row, dates as YYYY-MM-DD. utf-8 is the standard for data lakes."""
+    export = df.assign(rate_date=pd.to_datetime(df["rate_date"]).dt.strftime("%Y-%m-%d"))
+    return export.to_csv(index=False).encode("utf-8")
+
+
+def to_excel_bytes(df: pd.DataFrame) -> bytes:
+    """Excel workbook with one sheet. Dates are kept as real dates, so Excel can sort and filter them."""
+    buffer = io.BytesIO()                                   # an in-memory file
+    # rate_date holds Python date objects: openpyxl writes them as Excel dates
+    # with the yyyy-mm-dd display format.
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="fx_rates", index=False)
+    return buffer.getvalue()
+
+
+def to_json_bytes(df: pd.DataFrame) -> bytes:
+    """JSON array of records: [{"rate_date": "2026-10-01", "base_currency": "EUR", ...}, ...]."""
+    export = df.assign(rate_date=pd.to_datetime(df["rate_date"]).dt.strftime("%Y-%m-%d"))
+    return export.to_json(orient="records", indent=2).encode("utf-8")
+
+
+# Format -> (writer function, file extension, content type shown by S3 and browsers).
+EXPORT_FORMATS = {
+    "csv":   (to_csv_bytes,   "csv",  "text/csv"),
+    "excel": (to_excel_bytes, "xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+    "json":  (to_json_bytes,  "json", "application/json"),
+}
+
+
+def export_to_s3(df: pd.DataFrame) -> None:
+    """Upload the data to S3 once per format.
+
+    Files are organised by format and load date (a common data lake layout,
+    which tools such as AWS Athena and Glue can read as partitions):
+
+        s3://<bucket>/fx-rates/format=csv/load_date=2026-10-20/fx_rates_EUR_2026-08-21_2026-10-20.csv
+        s3://<bucket>/fx-rates/format=excel/load_date=2026-10-20/fx_rates_EUR_2026-08-21_2026-10-20.xlsx
+        s3://<bucket>/fx-rates/format=json/load_date=2026-10-20/fx_rates_EUR_2026-08-21_2026-10-20.json
+
+    Running the script twice on the same day overwrites the same files, so no duplicates.
+    """
+    bucket = os.getenv("S3_BUCKET")
+    prefix = os.getenv("S3_PREFIX", "fx-rates").strip("/")
+    print(f"[5/5] Exporting to AWS S3 bucket {bucket}")
+
+    # boto3 finds the credentials itself, in this order: environment variables
+    # (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY), the ~/.aws/credentials profile,
+    # then the IAM role of the machine (EC2, Lambda, ECS). No key in the code.
+    s3 = boto3.client("s3", region_name=os.getenv("AWS_REGION") or None)
+
+    file_name = f"fx_rates_{BASE_CURRENCY}_{df['rate_date'].min()}_{df['rate_date'].max()}"
+    load_date = date.today().isoformat()
+
+    try:
+        for fmt, (writer, extension, content_type) in EXPORT_FORMATS.items():
+            body = writer(df)
+            key = f"{prefix}/format={fmt}/load_date={load_date}/{file_name}.{extension}"
+            s3.put_object(
+                Bucket=bucket,
+                Key=key,
+                Body=body,
+                ContentType=content_type,
+                ServerSideEncryption="AES256",   # encrypt the file at rest in S3
+            )
+            print(f"      s3://{bucket}/{key}  ({len(body):,} bytes)")
+    except NoCredentialsError:
+        sys.exit("No AWS credentials found: set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, "
+                 "or configure an AWS profile.")
+    except ClientError as error:
+        # e.g. NoSuchBucket, AccessDenied, InvalidAccessKeyId
+        code = error.response["Error"]["Code"]
+        sys.exit(f"S3 upload failed ({code}): {error.response['Error'].get('Message', '')}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main() -> None:
+    load_dotenv()                          # read .env before checking which destinations are set
+    to_sql = bool(os.getenv("SQL_SERVER"))
+    to_s3 = bool(os.getenv("S3_BUCKET"))
+    if not (to_sql or to_s3):
+        sys.exit("No destination set: define SQL_SERVER and/or S3_BUCKET "
+                 "(environment variables or .env file).")
+
     data = extract()
     df = transform(data)
 
@@ -337,8 +443,17 @@ def main() -> None:
     if typed_df is None:
         sys.exit("Data quality checks failed: nothing loaded.")   # exit code 1
 
-    engine = get_engine()
-    load(typed_df, engine)
+    # The same checked data goes to every destination.
+    if to_sql:
+        load(typed_df, get_engine())
+    else:
+        print("[4/5] SQL Server skipped (SQL_SERVER not set)")
+
+    if to_s3:
+        export_to_s3(typed_df)
+    else:
+        print("[5/5] AWS S3 skipped (S3_BUCKET not set)")
+
     print("Done.")
 
 
